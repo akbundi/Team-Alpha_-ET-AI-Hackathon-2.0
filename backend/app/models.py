@@ -4,6 +4,7 @@ from typing import List, Optional, Dict, Any
 # Entity Extraction Structured JSON Models
 class IndustrialEntity(BaseModel):
     equipment_id: Optional[str] = Field(None, description="Unique identifier/tag of the equipment (e.g., PMP-102, TURB-04, BLR-99)")
+    work_order_id: Optional[str] = Field(None, description="Unique identifier/tag of the associated Work Order (e.g., WO-2026-4501)")
     component_name: Optional[str] = Field(None, description="Specific component name (e.g., impeller, ball bearing, mechanical seal, gasket)")
     failure_type: Optional[str] = Field(None, description="Type/Mode of mechanical or electrical failure (e.g., cavitation, fatigue crack, short circuit, corrosion)")
     technician: Optional[str] = Field(None, description="Name of the inspecting technician or engineer")
@@ -11,6 +12,9 @@ class IndustrialEntity(BaseModel):
     maintenance_action: Optional[str] = Field(None, description="Specific corrective action taken (e.g., replaced oil filter, aligned shaft, welded crack)")
     regulatory_references: List[str] = Field(default=[], description="Referenced safety codes, regulations, or standards (e.g., Factory Act Sec 21, OISD-189)")
     location: Optional[str] = Field(None, description="Physical location or plant unit (e.g., Utility Block, Cooling Tower 2, Refinery Section B)")
+    cause: Optional[str] = Field(None, description="Root cause of the mechanical/electrical failure (e.g., misalignment, lubrication failure)")
+    recommendation: Optional[str] = Field(None, description="Specific preventive recommendation or suggestion (e.g., implement monthly greasing schedule)")
+    manufacturer: Optional[str] = Field(None, description="Manufacturer/Brand of the equipment or component (e.g., Siemens, Sulzer, Flowserve)")
 
 class EntityExtractionResult(BaseModel):
     entities: List[IndustrialEntity] = Field(default=[], description="List of extracted industrial entities from the text")

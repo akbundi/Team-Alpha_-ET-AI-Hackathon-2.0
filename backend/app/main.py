@@ -1,4 +1,5 @@
 import os
+os.environ["ANONYMOUS_TELEMETRY"] = "False"
 import shutil
 import logging
 from typing import Dict, Any, List
@@ -113,48 +114,46 @@ async def upload_document(
 
         # ── 5. Neo4j Graph Ingestion (whole-document entity extraction) ───────────
         graph_entities_indexed = 0
-        if graph_store.is_connected:
-            try:
-                # Concatenate ALL page text into one document-level string
-                full_text = " ".join(
-                    p["content"] for p in parsed_doc["pages"] if p.get("content")
-                )
+        try:
+            # Concatenate ALL page text into one document-level string
+            full_text = " ".join(
+                p["content"] for p in parsed_doc["pages"] if p.get("content")
+            )
 
-                # Entity extraction on the full document
-                entity_prompt = (
-                    f"Analyze the following industrial document (full text):\n\"\"\"{full_text[:8000]}\"\"\"\n\n"
-                    f"Extract all equipment IDs, component names, failure modes, technicians, dates, "
-                    f"maintenance actions, regulatory references, and plant locations."
-                )
-                system_ep = "You are an expert Entity Extraction system for industrial maintenance logs."
-                extraction: EntityExtractionResult = llm_service.generate_structured(
-                    prompt=entity_prompt,
-                    response_model=EntityExtractionResult,
-                    system_prompt=system_ep
-                )
+            # Entity extraction on the full document
+            entity_prompt = (
+                f"Analyze the following industrial document (full text):\n\"\"\"{full_text[:8000]}\"\"\"\n\n"
+                f"Extract all equipment IDs, component names, failure modes, technicians, dates, "
+                f"maintenance actions, regulatory references, plant locations, root causes, preventive recommendations, and manufacturers."
+            )
+            system_ep = "You are an expert Entity Extraction system for industrial maintenance logs."
+            extraction: EntityExtractionResult = llm_service.generate_structured(
+                prompt=entity_prompt,
+                response_model=EntityExtractionResult,
+                system_prompt=system_ep
+            )
 
-                entities_dicts = [e.model_dump() for e in extraction.entities]
+            entities_dicts = [e.model_dump() for e in extraction.entities]
 
-                # Upsert into Neo4j (whole-document, versioned, with ChromaDB chunk IDs)
-                graph_entities_indexed = graph_store.upsert_entities(
-                    entities=entities_dicts,
-                    doc_name=parsed_doc["document_name"],
-                    doc_version=doc_version,
-                    page_count=parsed_doc["metadata"]["page_count"],
-                    chunk_ids=chunk_ids,
-                )
+            # Upsert into Neo4j or local cache
+            graph_entities_indexed = graph_store.upsert_entities(
+                entities=entities_dicts,
+                doc_name=parsed_doc["document_name"],
+                doc_version=doc_version,
+                page_count=parsed_doc["metadata"]["page_count"],
+                chunk_ids=chunk_ids,
+            )
 
+            if graph_store.is_connected:
                 # Build SIMILAR_TO edges across the whole graph
                 graph_store.build_similar_failure_edges()
 
-                logger.info(
-                    f"Graph ingestion complete: {graph_entities_indexed} entities, "
-                    f"{len(chunk_ids)} chunk IDs linked"
-                )
-            except Exception as ge:
-                logger.error(f"Neo4j graph ingestion failed (non-fatal): {ge}")
-        else:
-            logger.info("Neo4j not connected — skipping graph ingestion.")
+            logger.info(
+                f"Graph ingestion complete: {graph_entities_indexed} entities, "
+                f"{len(chunk_ids)} chunk IDs linked"
+            )
+        except Exception as ge:
+            logger.error(f"Graph ingestion failed (non-fatal): {ge}")
 
         return {
             "message": f"Document '{file.filename}' processed and indexed successfully.",
@@ -289,7 +288,7 @@ def extract_entities(req: ExtractionRequest):
             f"Analyze the following industrial log, inspection report, or technician notes:\n"
             f"\"\"\"\n{req.text}\n\"\"\"\n\n"
             f"Extract all equipment IDs, component names, failure modes, technicians, dates, "
-            f"maintenance actions, regulatory references, and plant locations."
+            f"maintenance actions, regulatory references, plant locations, root causes, preventive recommendations, and manufacturers."
         )
         system_prompt = "You are an expert Entity Extraction system for industrial maintenance logs."
         res = llm_service.generate_structured(

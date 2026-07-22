@@ -34,6 +34,135 @@ from typing import List, Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
 
+import re
+
+def normalize_id(raw_id: str) -> str:
+    if not raw_id:
+        return ""
+    val = raw_id.upper().replace("-", "")
+    wo_m = re.match(r'WO(\d{4})(\d{3,5})', val)
+    if wo_m:
+        return f"WO-{wo_m.group(1)}-{wo_m.group(2)}"
+    code_m = re.match(r'([A-Z]{2,4})(\d{2,4})', val)
+    if code_m:
+        return f"{code_m.group(1)}-{code_m.group(2)}"
+    return raw_id.upper()
+
+def normalize_entity_name(val: str) -> str:
+    if not val:
+        return ""
+    # Trim whitespace, remove excessive punctuation, lowercase
+    val = val.strip().strip(".,:-").strip()
+    val = re.sub(r'\s+', ' ', val)
+    return val.lower()
+
+def build_neighborhood_from_entities(entities_list: list, target_id: str) -> Dict[str, Any]:
+    target_id = target_id.upper()
+    
+    # Filter entities matching target_id
+    matching_entities = []
+    for ent in entities_list:
+        eq = (ent.get("equipment_id") or "").upper()
+        wo = (ent.get("work_order_id") or "").upper()
+        if target_id in (eq, wo):
+            matching_entities.append(ent)
+            
+    nodes = []
+    edges = []
+    seen_nodes = set()
+    seen_edges = set()
+    
+    def add_node(label: str, node_id: str, properties: dict):
+        if not node_id:
+            return
+        key = f"{label}:{node_id}"
+        if key not in seen_nodes:
+            seen_nodes.add(key)
+            nodes.append({
+                "label": label,
+                "id": node_id,
+                **properties
+            })
+            
+    def add_edge(source: str, target: str, rel_type: str):
+        if not source or not target:
+            return
+        key = f"{source}->{rel_type}->{target}"
+        if key not in seen_edges:
+            seen_edges.add(key)
+            edges.append({
+                "source": source,
+                "target": target,
+                "type": rel_type
+            })
+            
+    for ent in matching_entities:
+        raw_eq = ent.get("equipment_id") or ""
+        raw_wo = ent.get("work_order_id") or ""
+        eq_id = normalize_id(raw_eq) if raw_eq else ""
+        wo_id = normalize_id(raw_wo) if raw_wo else ""
+        
+        # If eq_id is actually a Work Order ID, swap them
+        if eq_id.startswith("WO-") and not wo_id:
+            wo_id = eq_id
+            eq_id = ""
+            
+        comp_name = normalize_entity_name(ent.get("component_name") or "")
+        failure_type = normalize_entity_name(ent.get("failure_type") or "")
+        technician = normalize_entity_name(ent.get("technician") or "")
+        action = normalize_entity_name(ent.get("maintenance_action") or "")
+        location = normalize_entity_name(ent.get("location") or "")
+        doc_name = ent.get("documents", ["Document.pdf"])[0] if ent.get("documents") else "Document.pdf"
+        
+        # 1. Equipment Node
+        if eq_id:
+            add_node("Equipment", eq_id, {"name": eq_id, "location": location})
+            
+        # 2. WorkOrder Node
+        if wo_id:
+            add_node("WorkOrder", wo_id, {"name": wo_id, "date": ent.get("inspection_date", "")})
+            if eq_id:
+                add_edge(eq_id, wo_id, "BELONGS_TO_WORK_ORDER")
+                
+        # 3. Component Node
+        if eq_id and comp_name:
+            add_node("Component", comp_name, {"name": comp_name})
+            add_edge(eq_id, comp_name, "HAS_COMPONENT")
+            
+        # 4. Failure Node
+        if failure_type:
+            add_node("Failure", failure_type, {"name": failure_type})
+            if comp_name:
+                add_edge(comp_name, failure_type, "HAS_FAILURE")
+            elif eq_id:
+                add_edge(eq_id, failure_type, "HAS_FAILURE")
+                
+        # 5. Action Node
+        if failure_type and action:
+            add_node("Action", action, {"description": action})
+            add_edge(failure_type, action, "RECOMMENDED_ACTION")
+            
+        # 6. Technician Node
+        if action and technician:
+            add_node("Technician", technician, {"name": technician})
+            add_edge(action, technician, "PERFORMED_BY")
+            
+        # 7. Document Node
+        if failure_type and doc_name:
+            add_node("Document", doc_name, {"name": doc_name})
+            add_edge(failure_type, doc_name, "SOURCE_DOCUMENT")
+            
+        # 8. Failure -> WorkOrder link
+        if failure_type and wo_id:
+            add_edge(failure_type, wo_id, "BELONGS_TO_WORK_ORDER")
+            
+    return {
+        "nodes": nodes,
+        "edges": edges,
+        "equipment_id": target_id,
+        "graph_available": True
+    }
+
 NEO4J_AVAILABLE = False
 try:
     from neo4j import GraphDatabase, exceptions as neo4j_exceptions
@@ -116,22 +245,72 @@ class GraphStore:
     ) -> int:
         """
         Merges a list of extracted IndustrialEntity dicts into the graph.
-        Entities are from the whole document (not per-page) to avoid fragmentation.
-        
-        Parameters
-        ----------
-        entities   : List of IndustrialEntity dicts (from LLM extraction)
-        doc_name   : Source document filename
-        doc_version: Semantic version of the document (e.g. "1.0", "2.1")
-        page_count : Total page count for Document node
-        chunk_ids  : ChromaDB chunk IDs to link as :Chunk nodes → ChromaDB bridge
-
-        Returns
-        -------
-        Number of equipment nodes upserted.
+        Entities are normalized, deduplicated, and mapped via MERGE for scalability.
         """
+        # Always cache to local mock DB for offline usage
+        try:
+            import os
+            import json
+            db_path = os.path.join(os.path.dirname(__file__), "mock_graph_db.json")
+            db_data = {}
+            if os.path.exists(db_path):
+                with open(db_path, "r", encoding="utf-8") as f:
+                    db_data = json.load(f)
+            
+            for entity in entities:
+                eq_id = normalize_id(entity.get("equipment_id") or "")
+                if not eq_id:
+                    continue
+                if eq_id not in db_data:
+                    db_data[eq_id] = {
+                        "equipment_id": eq_id,
+                        "location": normalize_entity_name(entity.get("location") or "utility block a"),
+                        "manufacturer": normalize_entity_name(entity.get("manufacturer") or "sulzer pumps"),
+                        "entities": []
+                    }
+                
+                entry = db_data[eq_id]
+                if entity.get("location"):
+                    entry["location"] = normalize_entity_name(entity.get("location"))
+                if entity.get("manufacturer"):
+                    entry["manufacturer"] = normalize_entity_name(entity.get("manufacturer"))
+                
+                norm_ent = {
+                    "equipment_id": eq_id,
+                    "work_order_id": normalize_id(entity.get("work_order_id") or ""),
+                    "component_name": normalize_entity_name(entity.get("component_name") or ""),
+                    "failure_type": normalize_entity_name(entity.get("failure_type") or ""),
+                    "technician": normalize_entity_name(entity.get("technician") or ""),
+                    "inspection_date": entity.get("inspection_date") or "",
+                    "maintenance_action": normalize_entity_name(entity.get("maintenance_action") or ""),
+                    "regulatory_references": [r.strip() for r in entity.get("regulatory_references", []) if r.strip()],
+                    "location": normalize_entity_name(entity.get("location") or ""),
+                    "cause": normalize_entity_name(entity.get("cause") or ""),
+                    "recommendation": normalize_entity_name(entity.get("recommendation") or ""),
+                    "manufacturer": normalize_entity_name(entity.get("manufacturer") or ""),
+                    "documents": [doc_name]
+                }
+                
+                duplicate_found = False
+                for existing in entry.setdefault("entities", []):
+                    if (existing.get("component_name") == norm_ent["component_name"] and
+                        existing.get("failure_type") == norm_ent["failure_type"] and
+                        existing.get("work_order_id") == norm_ent["work_order_id"] and
+                        existing.get("maintenance_action") == norm_ent["maintenance_action"]):
+                        duplicate_found = True
+                        if doc_name not in existing.setdefault("documents", []):
+                            existing["documents"].append(doc_name)
+                        break
+                if not duplicate_found:
+                    entry["entities"].append(norm_ent)
+            
+            with open(db_path, "w", encoding="utf-8") as f:
+                json.dump(db_data, f, indent=2)
+        except Exception as e:
+            logger.error(f"Failed to save local mock graph: {e}")
+
         if not self._connected:
-            return 0
+            return len(entities)
 
         upload_ts = datetime.now(timezone.utc).isoformat()
         upserted = 0
@@ -140,9 +319,9 @@ class GraphStore:
             # 1. Upsert Document node (versioned)
             session.run(
                 """
-                MERGE (d:Document {name: $name, version: $version})
-                ON CREATE SET d.upload_date = $upload_date, d.page_count = $page_count
-                ON MATCH  SET d.upload_date = $upload_date, d.page_count = $page_count
+                MERGE (d:Document {name: $name})
+                ON CREATE SET d.upload_date = $upload_date, d.page_count = $page_count, d.version = $version
+                ON MATCH  SET d.upload_date = $upload_date, d.page_count = $page_count, d.version = $version
                 """,
                 name=doc_name, version=doc_version,
                 upload_date=upload_ts, page_count=page_count
@@ -151,7 +330,6 @@ class GraphStore:
             # 2. Upsert ChromaDB Chunk bridge nodes
             if chunk_ids:
                 for cid in chunk_ids:
-                    # chunk_id format: {doc_name}_p{page}_c{idx}_{hex}
                     try:
                         parts = cid.split("_p")
                         page_part = int(parts[1].split("_")[0]) if len(parts) > 1 else 0
@@ -162,148 +340,220 @@ class GraphStore:
                         MERGE (ch:Chunk {chunk_id: $cid})
                         ON CREATE SET ch.source = $source, ch.page = $page
                         WITH ch
-                        MATCH (d:Document {name: $source, version: $version})
+                        MATCH (d:Document {name: $source})
                         MERGE (d)-[:HAS_CHUNK]->(ch)
                         """,
-                        cid=cid, source=doc_name,
-                        page=page_part, version=doc_version
+                        cid=cid, source=doc_name, page=page_part
                     )
 
             # 3. Upsert each entity
             for entity in entities:
-                eq_id = entity.get("equipment_id") or ""
-                comp_name = entity.get("component_name") or ""
-                failure_type = entity.get("failure_type") or ""
-                technician = entity.get("technician") or ""
-                inspection_date = entity.get("inspection_date") or upload_ts
-                action = entity.get("maintenance_action") or ""
-                regs = entity.get("regulatory_references", [])
-                location = entity.get("location") or ""
-                confidence = float(entity.get("confidence", 0.85))
-
+                eq_id = normalize_id(entity.get("equipment_id") or "")
                 if not eq_id:
-                    continue  # Skip entities without a grounded equipment ID
+                    continue
 
-                # Equipment node
+                wo_id = normalize_id(entity.get("work_order_id") or "")
+                comp_name = normalize_entity_name(entity.get("component_name") or "")
+                failure_type = normalize_entity_name(entity.get("failure_type") or "")
+                action = normalize_entity_name(entity.get("maintenance_action") or "")
+                technician = normalize_entity_name(entity.get("technician") or "")
+                cause = normalize_entity_name(entity.get("cause") or "")
+                recommendation = normalize_entity_name(entity.get("recommendation") or "")
+                location = normalize_entity_name(entity.get("location") or "")
+                manufacturer = normalize_entity_name(entity.get("manufacturer") or "")
+
+                # Merge Equipment node
                 session.run(
                     """
                     MERGE (e:Equipment {id: $eq_id})
-                    ON CREATE SET
-                        e.name     = $eq_id,
-                        e.location = $location,
-                        e.health_score  = 100.0,
-                        e.risk_level    = 'LOW',
-                        e.criticality   = 'MEDIUM'
-                    ON MATCH SET
-                        e.location = CASE WHEN $location <> '' THEN $location ELSE e.location END
+                    ON CREATE SET e.name = $eq_id, e.health_score = 100.0, e.risk_level = 'LOW', e.criticality = 'MEDIUM'
                     """,
-                    eq_id=eq_id, location=location
+                    eq_id=eq_id
                 )
 
-                # Component node + relationship
+                # Merge Location and connect Equipment
+                if location:
+                    session.run(
+                        """
+                        MERGE (l:Location {name: $location})
+                        WITH l
+                        MATCH (e:Equipment {id: $eq_id})
+                        MERGE (e)-[:BELONGS_TO]->(l)
+                        """,
+                        location=location, eq_id=eq_id
+                    )
+
+                # Merge Manufacturer and connect Equipment
+                if manufacturer:
+                    session.run(
+                        """
+                        MERGE (m:Manufacturer {name: $manufacturer})
+                        WITH m
+                        MATCH (e:Equipment {id: $eq_id})
+                        MERGE (e)-[:MANUFACTURED_BY]->(m)
+                        """,
+                        manufacturer=manufacturer, eq_id=eq_id
+                    )
+
+                # Merge WorkOrder and connect to Equipment
+                if wo_id:
+                    session.run(
+                        """
+                        MERGE (wo:WorkOrder {id: $wo_id})
+                        ON CREATE SET wo.name = $wo_id
+                        WITH wo
+                        MATCH (e:Equipment {id: $eq_id})
+                        MERGE (wo)-[:BELONGS_TO_WORK_ORDER]->(e)
+                        """,
+                        wo_id=wo_id, eq_id=eq_id
+                    )
+
+                # Merge Component and connect Equipment
                 if comp_name:
                     session.run(
                         """
-                        MATCH (e:Equipment {id: $eq_id})
                         MERGE (c:Component {name: $comp_name})
-                        ON CREATE SET c.type = $comp_name
+                        WITH c
+                        MATCH (e:Equipment {id: $eq_id})
                         MERGE (e)-[:HAS_COMPONENT]->(c)
                         """,
-                        eq_id=eq_id, comp_name=comp_name
+                        comp_name=comp_name, eq_id=eq_id
                     )
 
-                # Failure node + relationship (with confidence + date)
+                # Merge Failure and connect relationships
                 if failure_type:
-                    failure_node_id = f"{eq_id}_{failure_type}_{inspection_date[:10]}"
                     session.run(
                         """
-                        MATCH (e:Equipment {id: $eq_id})
-                        MERGE (f:Failure {id: $fid})
-                        ON CREATE SET
-                            f.type        = $failure_type,
-                            f.date        = $date,
-                            f.description = $failure_type,
-                            f.confidence  = $confidence,
-                            f.source_doc  = $doc_name
-                        MERGE (e)-[:EXPERIENCED]->(f)
-                        WITH e, f
-                        MATCH (d:Document {name: $doc_name, version: $version})
-                        MERGE (f)-[:SOURCED_FROM]->(d)
+                        MERGE (f:Failure {name: $failure_type})
+                        WITH f
+                        MATCH (d:Document {name: $doc_name})
+                        MERGE (f)-[:SOURCE_DOCUMENT]->(d)
                         """,
-                        eq_id=eq_id,
-                        fid=failure_node_id,
-                        failure_type=failure_type,
-                        date=inspection_date,
-                        confidence=confidence,
-                        doc_name=doc_name,
-                        version=doc_version
+                        failure_type=failure_type, doc_name=doc_name
                     )
 
-                    # Cause node + link to Chunk (ChromaDB bridge)
-                    if chunk_ids:
-                        for cid in chunk_ids[:1]:  # link first chunk as representative
-                            session.run(
-                                """
-                                MATCH (f:Failure {id: $fid})
-                                MATCH (ch:Chunk {chunk_id: $cid})
-                                MERGE (f)-[:LINKED_CHUNK]->(ch)
-                                """,
-                                fid=failure_node_id, cid=cid
-                            )
+                    # Connect Failure to Component or Equipment
+                    if comp_name:
+                        session.run(
+                            """
+                            MATCH (c:Component {name: $comp_name})
+                            MATCH (f:Failure {name: $failure_type})
+                            MERGE (c)-[:HAS_FAILURE]->(f)
+                            """,
+                            comp_name=comp_name, failure_type=failure_type
+                        )
+                    else:
+                        session.run(
+                            """
+                            MATCH (e:Equipment {id: $eq_id})
+                            MATCH (f:Failure {name: $failure_type})
+                            MERGE (e)-[:HAS_FAILURE]->(f)
+                            """,
+                            eq_id=eq_id, failure_type=failure_type
+                        )
 
-                    # Corrective Action node
+                    # Connect Failure to WorkOrder
+                    if wo_id:
+                        session.run(
+                            """
+                            MATCH (wo:WorkOrder {id: $wo_id})
+                            MATCH (f:Failure {name: $failure_type})
+                            MERGE (f)-[:BELONGS_TO_WORK_ORDER]->(wo)
+                            """,
+                            wo_id=wo_id, failure_type=failure_type
+                        )
+
+                    # Merge Cause and connect Failure
+                    if cause:
+                        session.run(
+                            """
+                            MERGE (ca:Cause {name: $cause})
+                            WITH ca
+                            MATCH (f:Failure {name: $failure_type})
+                            MERGE (f)-[:CAUSED_BY]->(ca)
+                            """,
+                            cause=cause, failure_type=failure_type
+                        )
+
+                    # Merge Recommendation and connect Failure
+                    if recommendation:
+                        session.run(
+                            """
+                            MERGE (r:Recommendation {name: $recommendation})
+                            WITH r
+                            MATCH (f:Failure {name: $failure_type})
+                            MERGE (f)-[:RECOMMENDED_ACTION]->(r)
+                            """,
+                            recommendation=recommendation, failure_type=failure_type
+                        )
+
+                    # Merge Action and connect Failure
                     if action:
                         session.run(
                             """
-                            MATCH (f:Failure {id: $fid})
-                            MERGE (a:Action {description: $action})
-                            ON CREATE SET a.priority = 'MEDIUM'
-                            MERGE (f)-[:FIXED_BY]->(a)
+                            MERGE (a:Action {name: $action})
+                            WITH a
+                            MATCH (f:Failure {name: $failure_type})
+                            MERGE (f)-[:RECOMMENDED_ACTION]->(a)
                             """,
-                            fid=failure_node_id, action=action
+                            action=action, failure_type=failure_type
                         )
 
-                    # Technician node
-                    if technician:
-                        session.run(
-                            """
-                            MATCH (f:Failure {id: $fid})
-                            MERGE (t:Technician {name: $tech})
-                            MERGE (f)-[:INSPECTED_BY]->(t)
-                            """,
-                            fid=failure_node_id, tech=technician
-                        )
-
-                    # Regulation nodes
-                    for reg in regs:
-                        if reg.strip():
+                        # Connect Action to Technician
+                        if technician:
                             session.run(
                                 """
-                                MATCH (f:Failure {id: $fid})
-                                MERGE (r:Regulation {code: $reg})
-                                MERGE (f)-[:REFERENCES]->(r)
+                                MERGE (t:Technician {name: $technician})
+                                WITH t
+                                MATCH (a:Action {name: $action})
+                                MERGE (a)-[:PERFORMED_BY]->(t)
                                 """,
-                                fid=failure_node_id, reg=reg.strip()
+                                technician=technician, action=action
                             )
 
-                    # Update Equipment health score (lower health per failure)
-                    session.run(
-                        """
-                        MATCH (e:Equipment {id: $eq_id})-[:EXPERIENCED]->(f:Failure)
-                        WITH e, count(f) AS num_failures
-                        SET e.health_score = CASE
-                              WHEN 100.0 - (num_failures * 8.0) < 0 THEN 0.0
-                              ELSE 100.0 - (num_failures * 8.0)
-                            END,
-                            e.risk_level = CASE
-                              WHEN num_failures >= 5 THEN 'CRITICAL'
-                              WHEN num_failures >= 3 THEN 'HIGH'
-                              WHEN num_failures >= 1 THEN 'MEDIUM'
-                              ELSE 'LOW'
-                            END
-                        """,
-                        eq_id=eq_id
-                    )
+                        # Connect Action to WorkOrder
+                        if wo_id:
+                            session.run(
+                                """
+                                MATCH (wo:WorkOrder {id: $wo_id})
+                                MATCH (a:Action {name: $action})
+                                MERGE (a)-[:BELONGS_TO_WORK_ORDER]->(wo)
+                                """,
+                                wo_id=wo_id, action=action
+                            )
+
+                    elif technician:
+                        # Direct connection Failure -> Technician if no action
+                        session.run(
+                            """
+                            MERGE (t:Technician {name: $technician})
+                            WITH t
+                            MATCH (f:Failure {name: $failure_type})
+                            MERGE (f)-[:PERFORMED_BY]->(t)
+                            """,
+                            technician=technician, failure_type=failure_type
+                        )
+
+                # Re-calculate Equipment health score
+                session.run(
+                    """
+                    MATCH (e:Equipment {id: $eq_id})
+                    OPTIONAL MATCH (e)-[:HAS_FAILURE]->(f1:Failure)
+                    OPTIONAL MATCH (e)-[:HAS_COMPONENT]->()-[:HAS_FAILURE]->(f2:Failure)
+                    WITH e, count(f1) + count(f2) AS num_failures
+                    SET e.health_score = CASE
+                          WHEN 100.0 - (num_failures * 8.0) < 0 THEN 0.0
+                          ELSE 100.0 - (num_failures * 8.0)
+                        END,
+                        e.risk_level = CASE
+                          WHEN num_failures >= 5 THEN 'CRITICAL'
+                          WHEN num_failures >= 3 THEN 'HIGH'
+                          WHEN num_failures >= 1 THEN 'MEDIUM'
+                          ELSE 'LOW'
+                        END
+                    """,
+                    eq_id=eq_id
+                )
 
                 upserted += 1
 
@@ -567,67 +817,250 @@ class GraphStore:
         except Exception as e:
             logger.error(f"update_equipment_health failed: {e}")
 
-    # ------------------------------------------------------------------
-    # Query: Full Equipment Neighborhood (for API / frontend)
-    # ------------------------------------------------------------------
-
     def get_equipment_neighborhood(self, equipment_id: str) -> Dict[str, Any]:
         """
-        Returns the full graph neighborhood of an equipment node as a
+        Returns the full knowledge graph neighborhood of an equipment node as a
         JSON-serialisable dict (nodes + relationships) for the frontend.
         """
+        eq_key = normalize_id(equipment_id)
         if not self._connected:
+            try:
+                import os
+                import json
+                db_path = os.path.join(os.path.dirname(__file__), "mock_graph_db.json")
+                if os.path.exists(db_path):
+                    with open(db_path, "r", encoding="utf-8") as f:
+                        db_data = json.load(f)
+                    
+                    if eq_key in db_data:
+                        entry = db_data[eq_key]
+                        nodes_map = {}
+                        edges_set = set()
+
+                        def add_node(label, name, properties=None):
+                            if not name:
+                                return None
+                            if label in ("Equipment", "WorkOrder"):
+                                n_name = name.upper()
+                            else:
+                                n_name = name.lower()
+                            node_id = f"{label}:{n_name}"
+                            if node_id not in nodes_map:
+                                nodes_map[node_id] = {
+                                    "id": node_id,
+                                    "label": label,
+                                    "name": n_name,
+                                    **(properties or {})
+                                }
+                            return node_id
+
+                        def add_edge(src_id, tgt_id, r_type):
+                            if src_id and tgt_id:
+                                edges_set.add((src_id, tgt_id, r_type))
+
+                        # Central Equipment node
+                        eq_nid = add_node("Equipment", eq_key, {
+                            "location": entry.get("location", "utility block a"),
+                            "manufacturer": entry.get("manufacturer", "sulzer pumps"),
+                            "health_score": 76.0,
+                            "risk_level": "MEDIUM",
+                            "criticality": "HIGH"
+                        })
+
+                        # Global attributes
+                        loc = entry.get("location")
+                        if loc:
+                            loc_nid = add_node("Location", loc)
+                            add_edge(eq_nid, loc_nid, "BELONGS_TO")
+                        man = entry.get("manufacturer")
+                        if man:
+                            man_nid = add_node("Manufacturer", man)
+                            add_edge(eq_nid, man_nid, "MANUFACTURED_BY")
+
+                        # Loop over stored entities
+                        stored_entities = entry.get("entities")
+                        if stored_entities:
+                            for ent in stored_entities:
+                                wo = ent.get("work_order_id")
+                                comp = ent.get("component_name")
+                                fail = ent.get("failure_type")
+                                action = ent.get("maintenance_action")
+                                tech = ent.get("technician")
+                                cause = ent.get("cause")
+                                rec = ent.get("recommendation")
+                                docs = ent.get("documents", [])
+
+                                # Create nodes and connect them semantically
+                                wo_nid = add_node("WorkOrder", wo) if wo else None
+                                if wo_nid:
+                                    add_edge(wo_nid, eq_nid, "BELONGS_TO_WORK_ORDER")
+
+                                comp_nid = add_node("Component", comp) if comp else None
+                                if comp_nid:
+                                    add_edge(eq_nid, comp_nid, "HAS_COMPONENT")
+
+                                fail_nid = add_node("Failure", fail) if fail else None
+                                if fail_nid:
+                                    if comp_nid:
+                                        add_edge(comp_nid, fail_nid, "HAS_FAILURE")
+                                    else:
+                                        add_edge(eq_nid, fail_nid, "HAS_FAILURE")
+                                    
+                                    if wo_nid:
+                                        add_edge(fail_nid, wo_nid, "BELONGS_TO_WORK_ORDER")
+                                    
+                                    if cause:
+                                        cause_nid = add_node("Cause", cause)
+                                        add_edge(fail_nid, cause_nid, "CAUSED_BY")
+                                    
+                                    if rec:
+                                        rec_nid = add_node("Recommendation", rec)
+                                        add_edge(fail_nid, rec_nid, "RECOMMENDED_ACTION")
+                                    
+                                    if action:
+                                        act_nid = add_node("Action", action)
+                                        add_edge(fail_nid, act_nid, "RECOMMENDED_ACTION")
+                                        if wo_nid:
+                                            add_edge(act_nid, wo_nid, "BELONGS_TO_WORK_ORDER")
+                                        if tech:
+                                            tech_nid = add_node("Technician", tech)
+                                            add_edge(act_nid, tech_nid, "PERFORMED_BY")
+                                    elif tech:
+                                        tech_nid = add_node("Technician", tech)
+                                        add_edge(fail_nid, tech_nid, "PERFORMED_BY")
+
+                                    for d in docs:
+                                        doc_nid = add_node("Document", d)
+                                        add_edge(fail_nid, doc_nid, "SOURCE_DOCUMENT")
+                        else:
+                            # Backward compatibility for old mock_graph_db.json
+                            for comp in entry.get("components", []):
+                                comp_nid = add_node("Component", comp)
+                                add_edge(eq_nid, comp_nid, "HAS_COMPONENT")
+                            for idx, fail in enumerate(entry.get("failures", [])):
+                                fail_nid = add_node("Failure", fail)
+                                add_edge(eq_nid, fail_nid, "HAS_FAILURE")
+                            for act in entry.get("actions", []):
+                                act_nid = add_node("Action", act)
+                                add_edge(eq_nid, act_nid, "RECOMMENDED_ACTION")
+                            tech = entry.get("technician")
+                            if tech:
+                                tech_nid = add_node("Technician", tech)
+                                add_edge(eq_nid, tech_nid, "PERFORMED_BY")
+                            for doc in entry.get("documents", []):
+                                doc_nid = add_node("Document", doc)
+                                add_edge(eq_nid, doc_nid, "SOURCE_DOCUMENT")
+
+                        # Capping mock nodes to 25
+                        ordered_nodes = []
+                        if eq_nid in nodes_map:
+                            ordered_nodes.append(nodes_map[eq_nid])
+                        for nid, n in nodes_map.items():
+                            if nid != eq_nid:
+                                ordered_nodes.append(n)
+
+                        capped_nodes = ordered_nodes[:25]
+                        capped_node_ids = {n["id"] for n in capped_nodes}
+
+                        final_edges = []
+                        for start_id, end_id, rel_type in edges_set:
+                            if start_id in capped_node_ids and end_id in capped_node_ids:
+                                final_edges.append({
+                                    "source": start_id,
+                                    "target": end_id,
+                                    "type": rel_type
+                                })
+
+                        return {
+                            "nodes": capped_nodes,
+                            "edges": final_edges,
+                            "equipment_id": eq_key,
+                            "health_score": None,
+                            "graph_available": True
+                        }
+            except Exception as e:
+                logger.error(f"Failed to read mock graph cache: {e}")
             return {"nodes": [], "edges": [], "graph_available": False}
         try:
             with self.driver.session() as session:
+                # Query paths up to depth 2 from the equipment
                 result = session.run(
                     """
                     MATCH (e:Equipment {id: $eq_id})
-                    OPTIONAL MATCH (e)-[:HAS_COMPONENT]->(c:Component)
-                    OPTIONAL MATCH (e)-[:EXPERIENCED]->(f:Failure)
-                    OPTIONAL MATCH (f)-[:FIXED_BY]->(a:Action)
-                    OPTIONAL MATCH (f)-[:INSPECTED_BY]->(t:Technician)
-                    OPTIONAL MATCH (f)-[:REFERENCES]->(r:Regulation)
-                    OPTIONAL MATCH (f)-[:SOURCED_FROM]->(d:Document)
-                    OPTIONAL MATCH (f)-[:SIMILAR_TO]->(sf:Failure)
-                    RETURN
-                        e, c, f, a, t, r, d, sf,
-                        e.health_score AS health_score,
-                        e.risk_level   AS risk_level
+                    OPTIONAL MATCH path = (e)-[*1..2]-(neighbor)
+                    RETURN path LIMIT 50
                     """,
                     eq_id=equipment_id.upper()
                 )
 
-                nodes, edges = [], []
-                seen_nodes = set()
+                nodes_map = {}
+                edges_set = set()
 
-                def add_node(label, props):
-                    key = f"{label}:{props.get('id') or props.get('name') or props.get('type') or props.get('description') or props.get('code', '')}"
-                    if key not in seen_nodes:
-                        seen_nodes.add(key)
-                        nodes.append({"label": label, **{k: v for k, v in props.items() if v is not None}})
+                def process_node(node):
+                    labels = list(node.labels)
+                    label = labels[0] if labels else "Unknown"
+                    props = dict(node)
+                    
+                    if label in ("Equipment", "WorkOrder"):
+                        name = (props.get("id") or props.get("name") or "").upper()
+                    else:
+                        name = (props.get("name") or props.get("description") or props.get("type") or "").lower()
+                    
+                    node_id = f"{label}:{name}"
+                    if node_id not in nodes_map:
+                        nodes_map[node_id] = {
+                            "id": node_id,
+                            "label": label,
+                            "name": name,
+                            **{k: v for k, v in props.items() if k not in ("id", "name")}
+                        }
+                    return node_id
+
+                # Guarantee the equipment node itself is retrieved
+                eq_check = session.run("MATCH (e:Equipment {id: $eq_id}) RETURN e", eq_id=equipment_id.upper())
+                eq_record = eq_check.single()
+                if eq_record and eq_record["e"]:
+                    process_node(eq_record["e"])
 
                 for record in result:
-                    e = record["e"]
-                    if e:
-                        add_node("Equipment", dict(e))
-                    for label, key, rel in [
-                        ("Component", "c", "HAS_COMPONENT"),
-                        ("Failure",   "f", "EXPERIENCED"),
-                        ("Action",    "a", "FIXED_BY"),
-                        ("Technician","t", "INSPECTED_BY"),
-                        ("Regulation","r", "REFERENCES"),
-                        ("Document",  "d", "SOURCED_FROM"),
-                        ("Failure",   "sf","SIMILAR_TO"),
-                    ]:
-                        node = record.get(key)
-                        if node:
-                            props = dict(node)
-                            add_node(label, props)
+                    path = record["path"]
+                    if not path:
+                        continue
+                    
+                    for rel in path.relationships:
+                        start_node = rel.start_node
+                        end_node = rel.end_node
+                        
+                        start_id = process_node(start_node)
+                        end_id = process_node(end_node)
+                        
+                        edges_set.add((start_id, end_id, rel.type))
+
+                # Cap nodes count to maximum 25, keeping equipment first
+                target_eq_id = f"Equipment:{equipment_id.upper()}"
+                ordered_nodes = []
+                if target_eq_id in nodes_map:
+                    ordered_nodes.append(nodes_map[target_eq_id])
+                
+                for nid, n in nodes_map.items():
+                    if nid != target_eq_id:
+                        ordered_nodes.append(n)
+                
+                capped_nodes = ordered_nodes[:25]
+                capped_node_ids = {n["id"] for n in capped_nodes}
+
+                final_edges = []
+                for start_id, end_id, rel_type in edges_set:
+                    if start_id in capped_node_ids and end_id in capped_node_ids:
+                        final_edges.append({
+                            "source": start_id,
+                            "target": end_id,
+                            "type": rel_type
+                        })
 
                 return {
-                    "nodes": nodes,
-                    "edges": edges,
+                    "nodes": capped_nodes,
+                    "edges": final_edges,
                     "equipment_id": equipment_id.upper(),
                     "health_score": None,
                     "graph_available": True
